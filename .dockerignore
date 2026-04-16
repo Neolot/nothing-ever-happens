@@ -1,0 +1,17 @@
+.git/
+.env
+.env.*
+config.json
+tests/
+scripts/
+*.sh
+*.md
+LICENSE
+.python-version
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
