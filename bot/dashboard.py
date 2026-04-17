@@ -324,8 +324,8 @@ class DashboardServer:
                 logger.debug("Resolution fetch failed for %s: %s", slug, exc)
 
     async def run(self) -> None:
-        login = os.getenv("DASHBOARD_LOGIN", "admin")
-        password = os.getenv("DASHBOARD_PASSWORD", "")
+        login = os.getenv("DASHBOARD_LOGIN", "admin").strip()
+        password = os.getenv("DASHBOARD_PASSWORD", "").strip()
 
         @web.middleware
         async def basic_auth(request, handler):
@@ -334,7 +334,7 @@ class DashboardServer:
             auth = request.headers.get("Authorization", "")
             if auth.startswith("Basic "):
                 try:
-                    decoded = base64.b64decode(auth[6:]).decode()
+                    decoded = base64.b64decode(auth[6:].strip()).decode()
                     user, pwd = decoded.split(":", 1)
                     if user == login and pwd == password:
                         return await handler(request)
