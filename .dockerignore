@@ -1,7 +1,6 @@
 .git/
 .env
 .env.*
-config.json
 tests/
 scripts/
 *.sh
@@ -15,3 +14,4 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
+
