@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -323,7 +324,29 @@ class DashboardServer:
                 logger.debug("Resolution fetch failed for %s: %s", slug, exc)
 
     async def run(self) -> None:
-        app = web.Application()
+        login = os.getenv("DASHBOARD_LOGIN", "admin")
+        password = os.getenv("DASHBOARD_PASSWORD", "")
+
+        @web.middleware
+        async def basic_auth(request, handler):
+            if not password:
+                return await handler(request)
+            auth = request.headers.get("Authorization", "")
+            if auth.startswith("Basic "):
+                try:
+                    decoded = base64.b64decode(auth[6:]).decode()
+                    user, pwd = decoded.split(":", 1)
+                    if user == login and pwd == password:
+                        return await handler(request)
+                except Exception:
+                    pass
+            return web.Response(
+                status=401,
+                headers={"WWW-Authenticate": 'Basic realm="Dashboard"'},
+                text="Unauthorized",
+            )
+
+        app = web.Application(middlewares=[basic_auth])
         app.router.add_get("/", self._index)
         app.router.add_get("/nothingeverhappens.svg", self._background_image)
         app.router.add_get("/ws", self._ws_handler)
