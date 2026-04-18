@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -326,10 +327,16 @@ class DashboardServer:
     async def run(self) -> None:
         login = os.getenv("DASHBOARD_LOGIN", "admin").strip()
         password = os.getenv("DASHBOARD_PASSWORD", "").strip()
+        cookie_name = "dash_session"
+        session_token = (
+            hashlib.sha256(f"{login}:{password}".encode()).hexdigest() if password else ""
+        )
 
         @web.middleware
         async def basic_auth(request, handler):
             if not password:
+                return await handler(request)
+            if request.cookies.get(cookie_name) == session_token:
                 return await handler(request)
             auth = request.headers.get("Authorization", "")
             if auth.startswith("Basic "):
@@ -337,7 +344,14 @@ class DashboardServer:
                     decoded = base64.b64decode(auth[6:].strip()).decode()
                     user, pwd = decoded.split(":", 1)
                     if user == login and pwd == password:
-                        return await handler(request)
+                        response = await handler(request)
+                        response.set_cookie(
+                            cookie_name,
+                            session_token,
+                            httponly=True,
+                            max_age=30 * 24 * 3600,
+                        )
+                        return response
                 except Exception:
                     pass
             return web.Response(
