@@ -134,6 +134,7 @@ class NothingHappensConfig:
     max_new_positions: int = -1
     shutdown_on_max_new_positions: bool = False
     redeemer_interval_sec: int = 1800
+    max_positions_per_cluster: int = 2
 
 
 def load_nothing_happens_config() -> tuple[ExchangeConfig, NothingHappensConfig]:
@@ -214,6 +215,10 @@ def _load_nothing_happens_config(
             "PM_NH_REDEEMER_INTERVAL_SEC",
             int(strat.get("redeemer_interval_sec", 1800)),
         ),
+        max_positions_per_cluster=_env_int(
+            "PM_NH_MAX_POSITIONS_PER_CLUSTER",
+            int(strat.get("max_positions_per_cluster", 2)),
+        ),
     )
     _validate_nothing_happens_config(strategy)
     return exchange, strategy
@@ -262,3 +267,5 @@ def _validate_nothing_happens_config(cfg: NothingHappensConfig) -> None:
         raise ValueError(f"max_new_positions must be >= -1, got {cfg.max_new_positions}")
     if cfg.redeemer_interval_sec < 60:
         raise ValueError(f"redeemer_interval_sec must be >= 60, got {cfg.redeemer_interval_sec}")
+    if cfg.max_positions_per_cluster < 0:
+        raise ValueError(f"max_positions_per_cluster must be >= 0, got {cfg.max_positions_per_cluster}")

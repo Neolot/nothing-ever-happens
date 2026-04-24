@@ -1051,6 +1051,322 @@ async def test_fetch_all_open_markets_retries_rate_limited_page() -> None:
     assert sleep_mock.await_args_list[0].args == (3.5,)
 
 
+# ---------------------------------------------------------------------------
+# Cluster-based position limit tests
+# ---------------------------------------------------------------------------
+
+
+def _make_iran_market(*, slug: str) -> StandaloneMarket:
+    return StandaloneMarket(
+        question="Will Iran launch a missile strike?",
+        slug=slug,
+        condition_id=f"cond-{slug}",
+        yes_token_id=f"yes-{slug}",
+        no_token_id=f"no-{slug}",
+        yes_price=0.30,
+        no_price=0.70,
+        volume=1000.0,
+        liquidity=1000.0,
+        min_order_size=5.0,
+        end_date=_FUTURE_END_DATE,
+        end_ts=_FUTURE_END_TS,
+        category="Geopolitics",
+        event_slug=slug,
+    )
+
+
+def _make_unclustered_market(*, slug: str) -> StandaloneMarket:
+    return StandaloneMarket(
+        question="Will X company go bankrupt by Q2?",
+        slug=slug,
+        condition_id=f"cond-{slug}",
+        yes_token_id=f"yes-{slug}",
+        no_token_id=f"no-{slug}",
+        yes_price=0.30,
+        no_price=0.70,
+        volume=1000.0,
+        liquidity=1000.0,
+        min_order_size=5.0,
+        end_date=_FUTURE_END_DATE,
+        end_ts=_FUTURE_END_TS,
+        category="Business",
+        event_slug=slug,
+    )
+
+
+def _make_iran_position_snapshot(market: StandaloneMarket) -> PositionSnapshot:
+    return PositionSnapshot(
+        slug=market.slug,
+        title=market.question,
+        outcome="No",
+        asset=market.no_token_id,
+        condition_id=market.condition_id,
+        size=10.0,
+        avg_price=0.5,
+        initial_value=5.0,
+        current_price=0.5,
+        current_value=5.0,
+        pnl_usd=0.0,
+        pnl_pct=0.0,
+        end_date=market.end_date,
+        eta_seconds=3600.0,
+        source="data_api",
+    )
+
+
+@pytest.mark.asyncio
+async def test_cluster_block_two_iran_positions_block_third_iran_candidate() -> None:
+    """With max_positions_per_cluster=2 and two iran positions open, a third iran
+    market must not be queued."""
+    iran_one = _make_iran_market(slug="iran-strike-q1")
+    iran_two = _make_iran_market(slug="iran-nuclear-q2")
+    iran_three = _make_iran_market(slug="iran-sanctions-q3")
+
+    exchange = StubExchange(
+        order_books={iran_three.no_token_id: _make_book(token_id=iran_three.no_token_id)}
+    )
+    runtime = _make_runtime(
+        exchange=exchange,
+        cfg=NothingHappensConfig(
+            fixed_trade_amount=5.0,
+            buy_retry_count=1,
+            max_positions_per_cluster=2,
+        ),
+    )
+    runtime._cash_balance = 100.0
+    runtime._markets_by_slug[iran_three.slug] = iran_three
+
+    # Simulate two open iran positions
+    runtime._positions_by_slug[iran_one.slug] = _make_iran_position_snapshot(iran_one)
+    runtime._positions_by_slug[iran_two.slug] = _make_iran_position_snapshot(iran_two)
+
+    await runtime._evaluate_market(iran_three)
+
+    assert iran_three.slug not in runtime._pending_entries_by_slug
+
+
+@pytest.mark.asyncio
+async def test_cluster_block_disabled_when_max_positions_per_cluster_is_zero() -> None:
+    """When max_positions_per_cluster=0 (disabled), no blocking happens even
+    with many same-cluster positions open."""
+    iran_one = _make_iran_market(slug="iran-zero-one")
+    iran_two = _make_iran_market(slug="iran-zero-two")
+    iran_three = _make_iran_market(slug="iran-zero-three")
+
+    exchange = StubExchange(
+        order_books={iran_three.no_token_id: _make_book(token_id=iran_three.no_token_id)}
+    )
+    runtime = _make_runtime(
+        exchange=exchange,
+        cfg=NothingHappensConfig(
+            fixed_trade_amount=5.0,
+            buy_retry_count=1,
+            max_positions_per_cluster=0,
+        ),
+    )
+    runtime._cash_balance = 100.0
+    runtime._markets_by_slug[iran_three.slug] = iran_three
+
+    # Two iran positions open — but limit is disabled
+    runtime._positions_by_slug[iran_one.slug] = _make_iran_position_snapshot(iran_one)
+    runtime._positions_by_slug[iran_two.slug] = _make_iran_position_snapshot(iran_two)
+
+    await runtime._evaluate_market(iran_three)
+
+    assert iran_three.slug in runtime._pending_entries_by_slug
+
+
+@pytest.mark.asyncio
+async def test_cluster_block_unclustered_market_never_blocked() -> None:
+    """An unclustered market should never be blocked by cluster logic regardless
+    of how many clustered positions are open."""
+    iran_one = _make_iran_market(slug="iran-unc-one")
+    iran_two = _make_iran_market(slug="iran-unc-two")
+    unrelated = _make_unclustered_market(slug="company-bankruptcy-q2")
+
+    exchange = StubExchange(
+        order_books={unrelated.no_token_id: _make_book(token_id=unrelated.no_token_id)}
+    )
+    runtime = _make_runtime(
+        exchange=exchange,
+        cfg=NothingHappensConfig(
+            fixed_trade_amount=5.0,
+            buy_retry_count=1,
+            max_positions_per_cluster=2,
+        ),
+    )
+    runtime._cash_balance = 100.0
+    runtime._markets_by_slug[unrelated.slug] = unrelated
+
+    # Two iran positions open — should NOT affect an unclustered market
+    runtime._positions_by_slug[iran_one.slug] = _make_iran_position_snapshot(iran_one)
+    runtime._positions_by_slug[iran_two.slug] = _make_iran_position_snapshot(iran_two)
+
+    await runtime._evaluate_market(unrelated)
+
+    assert unrelated.slug in runtime._pending_entries_by_slug
+
+
+@pytest.mark.asyncio
+async def test_cluster_block_pending_entries_count_toward_cluster_cap() -> None:
+    """One open iran position + one iran pending entry = cluster at cap (2).
+    A third iran market must not be queued."""
+    iran_one = _make_iran_market(slug="iran-pend-one")
+    iran_two = _make_iran_market(slug="iran-pend-two")
+    iran_three = _make_iran_market(slug="iran-pend-three")
+
+    exchange = StubExchange(
+        order_books={iran_three.no_token_id: _make_book(token_id=iran_three.no_token_id)}
+    )
+    runtime = _make_runtime(
+        exchange=exchange,
+        cfg=NothingHappensConfig(
+            fixed_trade_amount=5.0,
+            buy_retry_count=1,
+            max_positions_per_cluster=2,
+        ),
+    )
+    runtime._cash_balance = 100.0
+    runtime._markets_by_slug[iran_two.slug] = iran_two
+    runtime._markets_by_slug[iran_three.slug] = iran_three
+
+    # One position open + one pending
+    runtime._positions_by_slug[iran_one.slug] = _make_iran_position_snapshot(iran_one)
+    runtime._enqueue_pending_entry(iran_two)
+
+    await runtime._evaluate_market(iran_three)
+
+    assert iran_three.slug not in runtime._pending_entries_by_slug
+
+
+@pytest.mark.asyncio
+async def test_cluster_block_first_two_iran_markets_are_allowed() -> None:
+    """With max_positions_per_cluster=2, the first two iran markets should both
+    be queued (cluster not yet at cap)."""
+    iran_one = _make_iran_market(slug="iran-first-one")
+    iran_two = _make_iran_market(slug="iran-first-two")
+
+    exchange = StubExchange(
+        order_books={
+            iran_one.no_token_id: _make_book(token_id=iran_one.no_token_id),
+            iran_two.no_token_id: _make_book(token_id=iran_two.no_token_id),
+        }
+    )
+    runtime = _make_runtime(
+        exchange=exchange,
+        cfg=NothingHappensConfig(
+            fixed_trade_amount=5.0,
+            buy_retry_count=1,
+            max_positions_per_cluster=2,
+        ),
+    )
+    runtime._cash_balance = 100.0
+    runtime._markets_by_slug[iran_one.slug] = iran_one
+    runtime._markets_by_slug[iran_two.slug] = iran_two
+
+    await runtime._evaluate_market(iran_one)
+    await runtime._evaluate_market(iran_two)
+
+    assert iran_one.slug in runtime._pending_entries_by_slug
+    assert iran_two.slug in runtime._pending_entries_by_slug
+
+
+def _make_russia_ukraine_market(*, slug: str) -> StandaloneMarket:
+    return StandaloneMarket(
+        question="Will Russia capture a village in Donetsk?",
+        slug=slug,
+        condition_id=f"cond-{slug}",
+        yes_token_id=f"yes-{slug}",
+        no_token_id=f"no-{slug}",
+        yes_price=0.30,
+        no_price=0.70,
+        volume=1000.0,
+        liquidity=1000.0,
+        min_order_size=5.0,
+        end_date=_FUTURE_END_DATE,
+        end_ts=_FUTURE_END_TS,
+        category="Geopolitics",
+        event_slug=slug,
+    )
+
+
+def _make_position_snapshot(market: StandaloneMarket) -> PositionSnapshot:
+    return PositionSnapshot(
+        slug=market.slug,
+        title=market.question,
+        outcome="No",
+        asset=market.no_token_id,
+        condition_id=market.condition_id,
+        size=10.0,
+        avg_price=0.5,
+        initial_value=5.0,
+        current_price=0.5,
+        current_value=5.0,
+        pnl_usd=0.0,
+        pnl_pct=0.0,
+        end_date=market.end_date,
+        eta_seconds=3600.0,
+        source="data_api",
+    )
+
+
+@pytest.mark.asyncio
+async def test_russia_ukraine_override_allows_four_positions() -> None:
+    """russia-ukraine cluster has override limit 4; with max_positions_per_cluster=2
+    default, a 5th russia-ukraine market must still be blocked (override cap hit)."""
+    held = [_make_russia_ukraine_market(slug=f"ukr-{i}") for i in range(4)]
+    fifth = _make_russia_ukraine_market(slug="ukr-fifth")
+
+    exchange = StubExchange(
+        order_books={fifth.no_token_id: _make_book(token_id=fifth.no_token_id)}
+    )
+    runtime = _make_runtime(
+        exchange=exchange,
+        cfg=NothingHappensConfig(
+            fixed_trade_amount=5.0,
+            buy_retry_count=1,
+            max_positions_per_cluster=2,
+        ),
+    )
+    runtime._cash_balance = 100.0
+    runtime._markets_by_slug[fifth.slug] = fifth
+    for m in held:
+        runtime._positions_by_slug[m.slug] = _make_position_snapshot(m)
+
+    await runtime._evaluate_market(fifth)
+
+    assert fifth.slug not in runtime._pending_entries_by_slug
+
+
+@pytest.mark.asyncio
+async def test_russia_ukraine_override_allows_third_position_where_iran_blocks() -> None:
+    """With max_positions_per_cluster=2, a third iran market is blocked but a third
+    russia-ukraine market is allowed (override raises its cap to 4)."""
+    ukr_one = _make_russia_ukraine_market(slug="ukr-third-one")
+    ukr_two = _make_russia_ukraine_market(slug="ukr-third-two")
+    ukr_three = _make_russia_ukraine_market(slug="ukr-third-three")
+
+    exchange = StubExchange(
+        order_books={ukr_three.no_token_id: _make_book(token_id=ukr_three.no_token_id)}
+    )
+    runtime = _make_runtime(
+        exchange=exchange,
+        cfg=NothingHappensConfig(
+            fixed_trade_amount=5.0,
+            buy_retry_count=1,
+            max_positions_per_cluster=2,
+        ),
+    )
+    runtime._cash_balance = 100.0
+    runtime._markets_by_slug[ukr_three.slug] = ukr_three
+    runtime._positions_by_slug[ukr_one.slug] = _make_position_snapshot(ukr_one)
+    runtime._positions_by_slug[ukr_two.slug] = _make_position_snapshot(ukr_two)
+
+    await runtime._evaluate_market(ukr_three)
+
+    assert ukr_three.slug in runtime._pending_entries_by_slug
+
+
 @pytest.mark.asyncio
 async def test_fetch_candidate_markets_streams_batches_without_full_snapshot() -> None:
     batch = [

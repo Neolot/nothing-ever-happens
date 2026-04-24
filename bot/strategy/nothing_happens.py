@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import aiohttp
 
 from bot.config import NothingHappensConfig
+from bot.market_clusters import classify_clusters, effective_cluster_limit
 from bot.models import MarketOrderIntent, OrderBookSnapshot, Side
 from bot.nothing_happens_control import NothingHappensControlState
 from bot.order_status import normalize_order_status
@@ -382,6 +383,31 @@ class NothingHappensRuntime:
             and market.end_ts > now_ts
         ]
 
+    def _cluster_block_reason(self, market: StandaloneMarket) -> tuple[str, int] | None:
+        """Return (cluster_name, effective_limit) that blocks entry, or None if OK."""
+        if self.cfg.max_positions_per_cluster <= 0:
+            return None
+        market_clusters = classify_clusters(market.question, market.slug)
+        if not market_clusters:
+            return None
+        counts: dict[str, int] = {}
+        for snapshot in self._positions_by_slug.values():
+            for c in classify_clusters(snapshot.title, snapshot.slug):
+                counts[c] = counts.get(c, 0) + 1
+        for pending in self._pending_entries_by_slug.values():
+            for c in classify_clusters(pending.market.question, pending.market.slug):
+                counts[c] = counts.get(c, 0) + 1
+        for slug in self._recovery_blocked_slugs:
+            m = self._markets_by_slug.get(slug)
+            if m is not None:
+                for c in classify_clusters(m.question, m.slug):
+                    counts[c] = counts.get(c, 0) + 1
+        for c in market_clusters:
+            limit = effective_cluster_limit(c, self.cfg.max_positions_per_cluster)
+            if counts.get(c, 0) >= limit:
+                return c, limit
+        return None
+
     def _in_range_market_count(self, eligible_markets: list[StandaloneMarket]) -> int:
         return sum(1 for market in eligible_markets if self._market_in_range_by_slug.get(market.slug, False))
 
@@ -633,6 +659,17 @@ class NothingHappensRuntime:
                     len(self._positions_by_slug),
                     len(self._pending_entries_by_slug),
                     self._current_target_open_positions(),
+                )
+                self._schedule_backoff(market.slug, failed=False)
+                return
+            block = self._cluster_block_reason(market)
+            if block is not None:
+                cluster, limit = block
+                logger.info(
+                    "nothing_happens_cluster_block slug=%s cluster=%s limit=%d",
+                    market.slug,
+                    cluster,
+                    limit,
                 )
                 self._schedule_backoff(market.slug, failed=False)
                 return
